@@ -2,10 +2,15 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -62,7 +67,8 @@ func main() {
 
 	flagSet.CreateGroup("config", "config",
 		flagSet.StringVar(&cliOptions.Config, "config", defaultConfigLocation, "flag configuration file"),
-		flagSet.StringVarP(&cliOptions.RoutePrefix, "route-prefix", "rp", "/", "flag configuration file"),
+		flagSet.StringVarP(&cliOptions.SelfSignedDomain, "selfsigned-domain", "sd", "", "self signed domain to use for server"),
+		flagSet.StringVarP(&cliOptions.RoutePrefix, "route-prefix", "rp", "/", "route prefix for interactsh server"),
 		flagSet.BoolVarP(&cliOptions.DynamicResp, "dynamic-resp", "dr", false, "enable setting up arbitrary response data"),
 		flagSet.StringVarP(&cliOptions.CustomRecords, "custom-records", "cr", "", "custom dns records YAML file for DNS server"),
 		flagSet.StringVarP(&cliOptions.HTTPIndex, "http-index", "hi", "", "custom index file for http server"),
@@ -253,6 +259,14 @@ func main() {
 
 	var tlsConfig *tls.Config
 	switch {
+	case cliOptions.SelfSignedDomain != "":
+		cert, err := generateSelfSignedCert(cliOptions.SelfSignedDomain)
+		if err != nil {
+			gologger.Fatal().Msgf("couldn't generate self signed cert: %s\n", err)
+		}
+		tlsConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+		}
 	case cliOptions.CertificatePath != "" && cliOptions.PrivateKeyPath != "":
 		var domain string
 		if len(cliOptions.Domains) > 0 {
@@ -450,4 +464,31 @@ func getPublicIP() (string, error) {
 	}
 
 	return externalIP, errors.New("couldn't find an interface configured with external ip")
+}
+
+func generateSelfSignedCert(domain string) (tls.Certificate, error) {
+	privKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	template := x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: domain},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().AddDate(1, 0, 0),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{domain},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &privKey.PublicKey, privKey)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	// 将证书和私钥编码为 PEM 格式
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privKey)})
+
+	// 将 PEM 编码的证书和私钥返回为 tls.Certificate
+	return tls.X509KeyPair(certPEM, keyPEM)
 }
