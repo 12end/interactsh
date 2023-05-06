@@ -205,7 +205,7 @@ func main() {
 		gologger.Info().Msgf("Client Token: %s\n", serverOptions.Token)
 	}
 
-	evictionTTL := time.Duration(cliOptions.Eviction) * time.Hour * 24
+	evictionTTL := time.Duration(cliOptions.Eviction) * time.Hour
 	if cliOptions.NoEviction {
 		evictionTTL = -1
 	}

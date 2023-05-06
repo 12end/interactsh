@@ -260,7 +260,7 @@ func (h *HTTPServer) defaultHandler(w http.ResponseWriter, req *http.Request) {
 		if h.customBanner != "" {
 			fmt.Fprint(w, strings.ReplaceAll(h.customBanner, "{DOMAIN}", domain))
 		} else {
-			fmt.Fprintf(w, banner, domain)
+			fmt.Fprintf(w, "")
 		}
 	} else if strings.EqualFold(req.URL.Path, "/robots.txt") {
 		fmt.Fprintf(w, "User-agent: *\nDisallow: / # %s", reflection)
