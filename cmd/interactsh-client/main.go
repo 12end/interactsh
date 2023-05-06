@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
@@ -16,16 +16,13 @@ import (
 	"github.com/projectdiscovery/interactsh/internal/runner"
 	"github.com/projectdiscovery/interactsh/pkg/client"
 	"github.com/projectdiscovery/interactsh/pkg/options"
-	"github.com/projectdiscovery/interactsh/pkg/server"
 	"github.com/projectdiscovery/interactsh/pkg/settings"
 	fileutil "github.com/projectdiscovery/utils/file"
-	folderutil "github.com/projectdiscovery/utils/folder"
 	updateutils "github.com/projectdiscovery/utils/update"
 )
 
 var (
-	healthcheck           bool
-	defaultConfigLocation = filepath.Join(folderutil.HomeDirOrDefault("."), ".config/interactsh-client/config.yaml")
+	healthcheck bool
 )
 
 func main() {
@@ -38,11 +35,12 @@ func main() {
 	flagSet.SetDescription(`Interactsh client - Go client to generate interactsh payloads and display interaction data.`)
 
 	flagSet.CreateGroup("input", "Input",
-		flagSet.StringVarP(&cliOptions.ServerURL, "server", "s", defaultOpts.ServerURL, "interactsh server(s) to use"),
+		flagSet.StringVarP(&cliOptions.Domain, "domain", "d", "", "interactsh domain(s) to use"),
+		flagSet.StringVarP(&cliOptions.Server, "server", "s", "", "interactsh server to use"),
 	)
 
 	flagSet.CreateGroup("config", "config",
-		flagSet.StringVar(&cliOptions.Config, "config", defaultConfigLocation, "flag configuration file"),
+		flagSet.StringVarP(&cliOptions.RoutePrefix, "route-prefix", "rp", "/", "route prefix for interactsh server"),
 		flagSet.IntVarP(&cliOptions.NumberOfPayloads, "number", "n", 1, "number of interactsh payload to generate"),
 		flagSet.StringVarP(&cliOptions.Token, "token", "t", "", "authentication token to connect protected interactsh server"),
 		flagSet.IntVarP(&cliOptions.PollInterval, "poll-interval", "pi", 5, "poll interval in seconds to pull interaction data"),
@@ -82,7 +80,7 @@ func main() {
 	}
 
 	options.ShowBanner()
-
+	defaultOpts.Domains = strings.Split(cliOptions.Domain, ",")
 	if healthcheck {
 		cfgFilePath, _ := flagSet.GetConfigFilePath()
 		gologger.Print().Msgf("%s\n", runner.DoHealthCheck(cfgFilePath))
@@ -104,12 +102,6 @@ func main() {
 		}
 	}
 
-	if cliOptions.Config != defaultConfigLocation {
-		if err := flagSet.MergeConfigFile(cliOptions.Config); err != nil {
-			gologger.Fatal().Msgf("Could not read config: %s\n", err)
-		}
-	}
-
 	var outputFile *os.File
 	var err error
 	if cliOptions.Output != "" {
@@ -125,13 +117,11 @@ func main() {
 		_ = fileutil.Unmarshal(fileutil.YAML, []byte(cliOptions.SessionFile), &sessionInfo)
 	}
 
-	client, err := client.New(&client.Options{
-		ServerURL:                cliOptions.ServerURL,
-		Token:                    cliOptions.Token,
-		DisableHTTPFallback:      cliOptions.DisableHTTPFallback,
-		CorrelationIdLength:      cliOptions.CorrelationIdLength,
-		CorrelationIdNonceLength: cliOptions.CorrelationIdNonceLength,
-		SessionInfo:              sessionInfo,
+	c, err := client.New(&client.Options{
+		Server:              cliOptions.Server,
+		Token:               cliOptions.Token,
+		CorrelationIdLength: cliOptions.CorrelationIdLength,
+		Domains:             defaultOpts.Domains,
 	})
 	if err != nil {
 		gologger.Fatal().Msgf("Could not create client: %s\n", err)
@@ -139,7 +129,7 @@ func main() {
 
 	gologger.Info().Msgf("Listing %d payload for OOB Testing\n", cliOptions.NumberOfPayloads)
 	for i := 0; i < cliOptions.NumberOfPayloads; i++ {
-		gologger.Info().Msgf("%s\n", client.URL())
+		gologger.Info().Msgf("%s\n", c.URI())
 	}
 
 	// show all interactions
@@ -158,16 +148,12 @@ func main() {
 		}
 	}
 
-	_ = client.StartPolling(time.Duration(cliOptions.PollInterval)*time.Second, func(interaction *server.Interaction) {
+	_ = c.StartPolling(time.Duration(cliOptions.PollInterval)*time.Second, func(interaction *client.Interaction) {
 		if matcher != nil && !matcher.match(interaction.FullId) {
 			return
 		}
 		if filter != nil && filter.match(interaction.FullId) {
 			return
-		}
-
-		if cliOptions.Asn {
-			_ = client.TryGetAsnInfo(interaction)
 		}
 
 		if !cliOptions.JSON {
@@ -238,16 +224,13 @@ func main() {
 		}
 	})
 
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt)
-	for range c {
-		if cliOptions.SessionFile != "" {
-			_ = client.SaveSessionTo(cliOptions.SessionFile)
-		}
-		_ = client.StopPolling()
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt)
+	for range ch {
+		_ = c.StopPolling()
 		// whether the session is saved/loaded it shouldn't be destroyed {
 		if cliOptions.SessionFile == "" {
-			client.Close()
+			c.Close()
 		}
 		os.Exit(1)
 	}

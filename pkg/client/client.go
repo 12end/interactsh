@@ -1,8 +1,6 @@
 package client
 
 import (
-	"bytes"
-	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -10,35 +8,66 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"io"
+	"github.com/12end/request"
+	"github.com/pkg/errors"
 	mathrand "math/rand"
-	"net"
-	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"sync/atomic"
 	"time"
-
-	"github.com/google/uuid"
-	jsoniter "github.com/json-iterator/go"
-	"github.com/pkg/errors"
-	asnmap "github.com/projectdiscovery/asnmap/libs"
-	"github.com/projectdiscovery/gologger"
-	"github.com/projectdiscovery/interactsh/pkg/options"
-	"github.com/projectdiscovery/interactsh/pkg/server"
-	"github.com/projectdiscovery/interactsh/pkg/settings"
-	"github.com/projectdiscovery/interactsh/pkg/storage"
-	"github.com/projectdiscovery/retryablehttp-go"
-	errorutil "github.com/projectdiscovery/utils/errors"
-	iputil "github.com/projectdiscovery/utils/ip"
-	stringsutil "github.com/projectdiscovery/utils/strings"
-	"github.com/rs/xid"
-	zbase32 "gopkg.in/corvus-ch/zbase32.v1"
-	"gopkg.in/yaml.v3"
 )
+
+// DeregisterRequest is a request for client deregistration to interactsh server.
+type DeregisterRequest struct {
+	// CorrelationID is an ID for correlation with requests.
+	CorrelationID string `json:"correlation-id"`
+	// SecretKey is the secretKey for the interactsh client.
+	SecretKey string `json:"secret-key"`
+}
+
+// PollResponse is the response for a polling request
+type PollResponse struct {
+	Data    []string `json:"data"`
+	Extra   []string `json:"extra"`
+	AESKey  string   `json:"aes_key"`
+	TLDData []string `json:"tlddata,omitempty"`
+}
+
+// Interaction is an interaction received to the server.
+type Interaction struct {
+	// Protocol for interaction, can contains HTTP/DNS/SMTP,etc.
+	Protocol string `json:"protocol"`
+	// UniqueID is the uniqueID for the subdomain receiving the interaction.
+	UniqueID string `json:"unique-id"`
+	// FullId is the full path for the subdomain receiving the interaction.
+	FullId string `json:"full-id"`
+	// QType is the question type for the interaction
+	QType string `json:"q-type,omitempty"`
+	// RawRequest is the raw request received by the interactsh server.
+	RawRequest string `json:"raw-request,omitempty"`
+	// RawResponse is the raw response sent by the interactsh server.
+	RawResponse string `json:"raw-response,omitempty"`
+	// SMTPFrom is the mail form field
+	SMTPFrom string `json:"smtp-from,omitempty"`
+	// RemoteAddress is the remote address for interaction
+	RemoteAddress string `json:"remote-address"`
+	// Timestamp is the timestamp for the interaction
+	Timestamp time.Time           `json:"timestamp"`
+	AsnInfo   []map[string]string `json:"asninfo,omitempty"`
+}
+
+// RegisterRequest is a request for client registration to interactsh server.
+type RegisterRequest struct {
+	// PublicKey is the public RSA Key of the client.
+	PublicKey string `json:"public-key"`
+	// SecretKey is the secret-key for correlation ID registered for the client.
+	SecretKey string `json:"secret-key"`
+	// CorrelationID is an ID for correlation with requests.
+	CorrelationID string `json:"correlation-id"`
+}
 
 func init() {
 	//todo:automatic with go1.20
@@ -57,43 +86,38 @@ const (
 
 // Client is a client for communicating with interactsh server instance.
 type Client struct {
-	State                    atomic.Value
-	correlationID            string
-	secretKey                string
-	serverURL                *url.URL
-	httpClient               *retryablehttp.Client
-	privKey                  *rsa.PrivateKey
-	pubKey                   *rsa.PublicKey
-	quitChan                 chan struct{}
-	disableHTTPFallback      bool
-	token                    string
-	correlationIdLength      int
-	CorrelationIdNonceLength int
+	State               atomic.Value
+	correlationID       string
+	secretKey           string
+	server              string
+	serverUrl           string
+	routePrefix         string
+	domains             []string
+	domainLength        int
+	privKey             *rsa.PrivateKey
+	pubKey              *rsa.PublicKey
+	quitChan            chan struct{}
+	disableHTTPFallback bool
+	token               string
+	correlationIdLength int
 }
 
 // Options contains configuration options for interactsh client
 type Options struct {
 	// ServerURL is the URL for the interactsh server.
-	ServerURL string
+	Server      string
+	Domains     []string
+	RoutePrefix string
 	// Token if the server requires authentication
 	Token string
-	// DisableHTTPFallback determines if failed requests over https should not be retried over http
-	DisableHTTPFallback bool
 	// CorrelationIdLength of the preamble
 	CorrelationIdLength int
-	// CorrelationIdNonceLengthLength of the nonce
-	CorrelationIdNonceLength int
-	// HTTPClient use a custom http client
-	HTTPClient *retryablehttp.Client
-	// SessionInfo to resume an existing session
-	SessionInfo *options.SessionInfo
 }
 
 // DefaultOptions is the default options for the interact client
 var DefaultOptions = &Options{
-	ServerURL:                "oast.pro,oast.live,oast.site,oast.online,oast.fun,oast.me",
-	CorrelationIdLength:      settings.CorrelationIdLengthDefault,
-	CorrelationIdNonceLength: settings.CorrelationIdNonceLengthDefault,
+	CorrelationIdLength: 20,
+	RoutePrefix:         "/",
 }
 
 // New creates a new client instance based on provided options
@@ -102,73 +126,34 @@ func New(options *Options) (*Client, error) {
 	if options.CorrelationIdLength == 0 {
 		options.CorrelationIdLength = DefaultOptions.CorrelationIdLength
 	}
-	if options.CorrelationIdNonceLength == 0 {
-		options.CorrelationIdNonceLength = DefaultOptions.CorrelationIdNonceLength
-	}
-
-	var httpclient *retryablehttp.Client
-	if options.HTTPClient != nil {
-		httpclient = options.HTTPClient
-	} else {
-		opts := retryablehttp.DefaultOptionsSingle
-		opts.Timeout = 10 * time.Second
-		httpclient = retryablehttp.NewClient(opts)
-	}
 
 	var correlationID, secretKey, token string
 
-	if options.SessionInfo != nil {
-		correlationID = options.SessionInfo.CorrelationID
-		secretKey = options.SessionInfo.SecretKey
-		token = options.SessionInfo.Token
-	} else {
-		// Generate a random ksuid which will be used as server secret.
-		correlationID = xid.New().String()
-		if len(correlationID) > options.CorrelationIdLength {
-			correlationID = correlationID[:options.CorrelationIdLength]
-		}
-		secretKey = uuid.New().String()
-		token = options.Token
-	}
+	correlationID = RandString(options.CorrelationIdLength)
+	secretKey = RandString(8)
+	token = options.Token
 
 	client := &Client{
-		secretKey:                secretKey,
-		correlationID:            correlationID,
-		httpClient:               httpclient,
-		token:                    token,
-		disableHTTPFallback:      options.DisableHTTPFallback,
-		correlationIdLength:      options.CorrelationIdLength,
-		CorrelationIdNonceLength: options.CorrelationIdNonceLength,
+		secretKey:           secretKey,
+		correlationID:       correlationID,
+		token:               token,
+		correlationIdLength: options.CorrelationIdLength,
+		domains:             options.Domains,
+		domainLength:        len(options.Domains),
+		routePrefix:         options.RoutePrefix,
 	}
 
-	if options.SessionInfo != nil {
-		privKey, err := x509.ParsePKCS1PrivateKey([]byte(options.SessionInfo.PrivateKey))
-		if err == nil {
-			client.privKey = privKey
-		}
-		pubKey, err := decodePublicKey(options.SessionInfo.PublicKey)
-		if err == nil {
-			client.pubKey = pubKey
-		}
-		if serverURL, err := url.Parse(options.SessionInfo.ServerURL); err == nil {
-			client.serverURL = serverURL
-		}
-		// attempts to re-register - server will reject is already existing
-		registrationRequest, err := encodeRegistrationRequest(options.SessionInfo.PublicKey, options.SessionInfo.SecretKey, options.SessionInfo.CorrelationID)
-		if err != nil {
-			return nil, err
-		}
-		// silently fails to re-register if the session is still alive
-		_ = client.performRegistration(options.SessionInfo.ServerURL, registrationRequest)
-	} else {
-		payload, err := client.initializeRSAKeys()
-		if err != nil {
-			return nil, errors.Wrap(err, "could not initialize rsa keys")
-		}
+	if !strings.HasPrefix(client.routePrefix, "/") {
+		client.routePrefix = "/" + client.routePrefix
+	}
 
-		if err := client.parseServerURLs(options.ServerURL, payload); err != nil {
-			return nil, errors.Wrap(err, "could not register to servers")
-		}
+	payload, err := client.initializeRSAKeys()
+	if err != nil {
+		return nil, errors.Wrap(err, "could not initialize rsa keys")
+	}
+
+	if err := client.parseServerURLs(options.Domains, options.Server, payload); err != nil {
+		return nil, errors.Wrap(err, "could not register to servers")
 	}
 
 	return client, nil
@@ -176,35 +161,35 @@ func New(options *Options) (*Client, error) {
 
 // initializeRSAKeys does the one-time initialization for RSA crypto mechanism
 // and returns the data payload for the client.
-func (c *Client) initializeRSAKeys() ([]byte, error) {
+func (c *Client) initializeRSAKeys() (string, error) {
 	// Generate a 2048-bit private-key
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		return nil, errors.Wrap(err, "could not generate rsa private key")
+		return "", errors.Wrap(err, "could not generate rsa private key")
 	}
 	c.privKey = priv
 	c.pubKey = &priv.PublicKey
 
 	pubKeyData, err := encodePublicKey(c.pubKey)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
 	return encodeRegistrationRequest(pubKeyData, c.secretKey, c.correlationID)
 }
 
-func encodeRegistrationRequest(publicKey, secretkey, correlationID string) ([]byte, error) {
-	register := server.RegisterRequest{
+func encodeRegistrationRequest(publicKey, secretkey, correlationID string) (string, error) {
+	register := RegisterRequest{
 		PublicKey:     publicKey,
 		SecretKey:     secretkey,
 		CorrelationID: correlationID,
 	}
 
-	data, err := jsoniter.Marshal(register)
+	data, err := json.Marshal(register)
 	if err != nil {
-		return nil, errors.Wrap(err, "could not marshal register request")
+		return "", errors.Wrap(err, "could not marshal register request")
 	}
-	return data, nil
+	return string(data), nil
 }
 
 func encodePublicKey(pubKey *rsa.PublicKey) (string, error) {
@@ -249,53 +234,39 @@ func decodePublicKey(data string) (*rsa.PublicKey, error) {
 //
 // If the first picked random domain doesn't work, the list of domains is iterated
 // after being shuffled.
-func (c *Client) parseServerURLs(serverURL string, payload []byte) error {
-	if serverURL == "" {
+func (c *Client) parseServerURLs(domains []string, serverIP string, payload string) error {
+	if len(domains) == 0 {
 		return errors.New("invalid server url provided")
 	}
 
-	values := strings.Split(serverURL, ",")
-	firstIdx := mathrand.Intn(len(values))
-	gotValue := values[firstIdx]
-
-	registerFunc := func(got string) error {
-		if !stringsutil.HasPrefixAny(got, "http://", "https://") {
-			got = fmt.Sprintf("https://%s", got)
-		}
-		parsed, err := url.Parse(got)
-		if err != nil {
-			return errors.Wrap(err, "could not parse server URL")
-		}
-	makeReq:
-		if err := c.performRegistration(parsed.String(), payload); err != nil {
-			if !c.disableHTTPFallback && parsed.Scheme == "https" {
-				parsed.Scheme = "http"
-				gologger.Verbose().Msgf("Could not register to %s: %s, retrying with http\n", parsed.String(), err)
-				goto makeReq
-			}
-			return err
-		}
-		c.serverURL = parsed
-		return nil
+	var server string
+	if serverIP != "" {
+		server = serverIP
+	} else {
+		firstIdx := mathrand.Intn(len(domains))
+		server = domains[firstIdx]
 	}
-	err := registerFunc(gotValue)
+	if !strings.HasPrefix(server, "http://") && !strings.HasPrefix(server, "https://") {
+		server = fmt.Sprintf("https://%s", server)
+	}
+	parsed, err := url.Parse(server)
 	if err != nil {
-		gologger.Verbose().Msgf("Could not register to %s: %s, retrying with remaining\n", gotValue, err)
-		values = removeIndex(values, firstIdx)
-		mathrand.Shuffle(len(values), func(i, j int) { values[i], values[j] = values[j], values[i] })
-
-		for _, value := range values {
-			if err = registerFunc(value); err != nil {
-				gologger.Verbose().Msgf("Could not register to %s: %s, retrying with remaining\n", gotValue, err)
-				continue
-			}
-			break
+		return errors.Wrap(err, "could not parse server URL")
+	}
+	req, resp := request.AcquireRequestResponse()
+	err = req.Get(parsed.String()).Do(resp)
+	if err != nil {
+		parsed.Scheme = "http"
+		err = req.Get(parsed.String()).Do(resp)
+		if err != nil {
+			return errors.Wrap(err, "could not connect to server")
 		}
 	}
-	if c.serverURL != nil {
-		return nil
+	if err := c.performRegistration(parsed.String(), payload); err != nil {
+		return err
 	}
-	return err // return errors if any.
+	c.serverUrl = parsed.String()
+	return nil
 }
 
 func removeIndex(s []string, index int) []string {
@@ -303,7 +274,7 @@ func removeIndex(s []string, index int) []string {
 }
 
 // InteractionCallback is a callback function for a reported interaction
-type InteractionCallback func(*server.Interaction)
+type InteractionCallback func(*Interaction)
 
 // StartPolling starts polling the server each duration and returns any events
 // that may have been captured by the collaborator server.
@@ -329,11 +300,7 @@ func (c *Client) StartPolling(duration time.Duration, callback InteractionCallba
 			case <-ticker.C:
 				err := c.getInteractions(callback)
 				if err != nil {
-					if errorutil.IsAny(err, authError) {
-						gologger.Error().Msgf("Could not authenticate to the server %v", err)
-					} else if errorutil.IsAny(err, storage.ErrCorrelationIdNotFound) {
-						gologger.Error().Msgf("The correlation id was not found (probably evicted due to inactivity): %v", err)
-					}
+					fmt.Println("error polling:", err)
 				}
 			case <-c.quitChan:
 				ticker.Stop()
@@ -347,68 +314,47 @@ func (c *Client) StartPolling(duration time.Duration, callback InteractionCallba
 
 // getInteractions returns the interactions from the server.
 func (c *Client) getInteractions(callback InteractionCallback) error {
-	builder := &strings.Builder{}
-	builder.WriteString(c.serverURL.String())
-	builder.WriteString("/poll?id=")
-	builder.WriteString(c.correlationID)
-	builder.WriteString("&secret=")
-	builder.WriteString(c.secretKey)
-	req, err := retryablehttp.NewRequest("GET", builder.String(), nil)
-	if err != nil {
-		return err
-	}
-
+	req, resp := request.AcquireRequestResponse()
+	defer request.ReleaseRequestResponse(req, resp)
 	if c.token != "" {
-		req.Header.Add("Authorization", c.token)
+		req.SetHeader(request.Header{"Authorization": c.token})
 	}
-
-	resp, err := c.httpClient.Do(req)
-	defer func() {
-		if resp != nil && resp.Body != nil {
-			_ = resp.Body.Close()
-			_, _ = io.Copy(io.Discard, resp.Body)
-		}
-	}()
+	err := req.Get(c.serverUrl+c.routePrefix+"/poll", request.Params{"id": c.correlationID, "secret": c.secretKey}).Do(resp)
 	if err != nil {
 		return err
 	}
-	if resp.StatusCode != http.StatusOK {
-		if resp.StatusCode == http.StatusUnauthorized {
+	if resp.StatusCode() != 200 {
+		if resp.StatusCode() == 401 {
 			return authError
 		}
-		data, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return errors.Wrap(err, "could not read response body")
+		if strings.Contains(resp.Text(), "could not get correlation-id from cache") {
+			return errors.New("could not get correlation-id from cache")
 		}
-		if stringsutil.ContainsAny(string(data), storage.ErrCorrelationIdNotFound.Error()) {
-			return storage.ErrCorrelationIdNotFound
-		}
-		return fmt.Errorf("could not poll interactions: %s", string(data))
+		return fmt.Errorf("could not poll interactions: %s", resp.Text())
 	}
-	response := &server.PollResponse{}
-	if err := jsoniter.NewDecoder(resp.Body).Decode(response); err != nil {
-		gologger.Error().Msgf("Could not decode interactions: %v\n", err)
-		return err
+	response := &PollResponse{}
+	if err := json.Unmarshal(resp.Body(), response); err != nil {
+		return errors.Wrap(err, "Could not decode interactions")
 	}
 
 	for _, data := range response.Data {
 		plaintext, err := c.decryptMessage(response.AESKey, data)
 		if err != nil {
-			gologger.Error().Msgf("Could not decrypt interaction: %v\n", err)
+			fmt.Println("error decrypting interaction:", err)
 			continue
 		}
-		interaction := &server.Interaction{}
-		if err := jsoniter.Unmarshal(plaintext, interaction); err != nil {
-			gologger.Error().Msgf("Could not unmarshal interaction data interaction: %v\n", err)
+		interaction := &Interaction{}
+		if err := json.Unmarshal(plaintext, interaction); err != nil {
+			fmt.Println("error unmarshaling interaction:", err)
 			continue
 		}
 		callback(interaction)
 	}
 
 	for _, plaintext := range response.Extra {
-		interaction := &server.Interaction{}
-		if err := jsoniter.UnmarshalFromString(plaintext, interaction); err != nil {
-			gologger.Error().Msgf("Could not unmarshal interaction data interaction: %v\n", err)
+		interaction := &Interaction{}
+		if err := json.Unmarshal([]byte(plaintext), interaction); err != nil {
+			fmt.Println("error unmarshaling interaction:", err)
 			continue
 		}
 		callback(interaction)
@@ -416,9 +362,9 @@ func (c *Client) getInteractions(callback InteractionCallback) error {
 
 	// handle root-tld data if any
 	for _, data := range response.TLDData {
-		interaction := &server.Interaction{}
-		if err := jsoniter.UnmarshalFromString(data, interaction); err != nil {
-			gologger.Error().Msgf("Could not unmarshal interaction data interaction: %v\n", err)
+		interaction := &Interaction{}
+		if err := json.Unmarshal([]byte(data), interaction); err != nil {
+			fmt.Println("error unmarshaling interaction:", err)
 			continue
 		}
 		callback(interaction)
@@ -426,33 +372,8 @@ func (c *Client) getInteractions(callback InteractionCallback) error {
 
 	return nil
 }
-
-// TryGetAsnInfo attempts to enrich interaction with asn data
-func (c *Client) TryGetAsnInfo(interaction *server.Interaction) error {
-	var remoteIp string
-	if iputil.IsIP(interaction.RemoteAddress) {
-		remoteIp = interaction.RemoteAddress
-	} else {
-		var err error
-		remoteIp, _, err = net.SplitHostPort(interaction.RemoteAddress)
-		if err != nil {
-			return err
-		}
-	}
-
-	if asnItems, err := asnmap.DefaultClient.GetData(remoteIp); err == nil && len(asnItems) > 0 {
-		for _, asnItem := range asnItems {
-			// convert to map to prune and turn fields into camel case
-			newOutputAsnItem := make(map[string]string)
-			newOutputAsnItem["first-ip"] = asnItem.FirstIp
-			newOutputAsnItem["last-ip"] = asnItem.LastIp
-			newOutputAsnItem["asn"] = fmt.Sprintf("AS%d", asnItem.ASN)
-			newOutputAsnItem["country"] = asnItem.Country
-			newOutputAsnItem["org"] = asnItem.Org
-			interaction.AsnInfo = append(interaction.AsnInfo, newOutputAsnItem)
-		}
-	}
-	return nil
+func (c *Client) URI() string {
+	return c.correlationID + "." + c.domains[mathrand.Intn(c.domainLength)]
 }
 
 // StopPolling stops the polling to the interactsh server.
@@ -477,82 +398,52 @@ func (c *Client) Close() error {
 		return errors.New("client is already closed")
 	}
 
-	register := server.DeregisterRequest{
+	register := DeregisterRequest{
 		CorrelationID: c.correlationID,
 		SecretKey:     c.secretKey,
 	}
-	data, err := jsoniter.Marshal(register)
+	data, err := json.Marshal(register)
 	if err != nil {
 		return errors.Wrap(err, "could not marshal deregister request")
 	}
-	URL := c.serverURL.String() + "/deregister"
-	req, err := retryablehttp.NewRequest("POST", URL, bytes.NewReader(data))
-	if err != nil {
-		return errors.Wrap(err, "could not create new request")
-	}
-	req.ContentLength = int64(len(data))
-
+	req, resp := request.AcquireRequestResponse()
+	defer request.ReleaseRequestResponse(req, resp)
 	if c.token != "" {
 		req.Header.Add("Authorization", c.token)
 	}
-
-	resp, err := c.httpClient.Do(req)
-	defer func() {
-		if resp != nil && resp.Body != nil {
-			_ = resp.Body.Close()
-			_, _ = io.Copy(io.Discard, resp.Body)
-		}
-	}()
+	err = req.Post(c.serverUrl+c.routePrefix+"/deregister", data).Do(resp)
 	if err != nil {
 		return errors.Wrap(err, "could not make deregister request")
 	}
-	if resp.StatusCode != http.StatusOK {
-		data, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("could not deregister to server: %s", string(data))
+	if resp.StatusCode() != 200 {
+		return fmt.Errorf("could not deregister to server: %s", resp.Text())
 	}
-
 	c.State.Store(Closed)
-
 	return nil
 }
 
 // performRegistration registers the current client with the master server using the
 // provided RSA Public Key as well as Correlation Key.
-func (c *Client) performRegistration(serverURL string, payload []byte) error {
-	// By default we attempt registration once before switching to the next server
-	ctx := context.WithValue(context.Background(), retryablehttp.RETRY_MAX, 0)
-
-	URL := serverURL + "/register"
-	req, err := retryablehttp.NewRequestWithContext(ctx, "POST", URL, bytes.NewReader(payload))
-	if err != nil {
-		return errors.Wrap(err, "could not create new request")
-	}
-	req.ContentLength = int64(len(payload))
-
+func (c *Client) performRegistration(serverURL string, payload string) error {
+	req, resp := request.AcquireRequestResponse()
+	defer request.ReleaseRequestResponse(req, resp)
 	if c.token != "" {
-		req.Header.Add("Authorization", c.token)
+		req.SetHeader(request.Header{"Authorization": c.token})
 	}
-
-	resp, err := c.httpClient.Do(req)
-	defer func() {
-		if resp != nil && resp.Body != nil {
-			_ = resp.Body.Close()
-			_, _ = io.Copy(io.Discard, resp.Body)
-		}
-	}()
+	err := req.Post(serverURL+c.routePrefix+"register", payload).Do(resp)
 	if err != nil {
 		return errors.Wrap(err, "could not make register request")
 	}
-	if resp.StatusCode == http.StatusUnauthorized {
+	if resp.StatusCode() == 401 {
 		return errors.New("invalid token provided for interactsh server")
 	}
-	if resp.StatusCode != http.StatusOK {
-		data, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("could not register to server: %s", string(data))
+	if resp.StatusCode() != 200 {
+		return fmt.Errorf("could not register to server: %s", resp.String())
 	}
 	response := make(map[string]interface{})
-	if jsonErr := jsoniter.NewDecoder(resp.Body).Decode(&response); jsonErr != nil {
-		return errors.Wrap(jsonErr, "could not register to server")
+	err = json.Unmarshal(resp.Body(), &response)
+	if err != nil {
+		return errors.Wrap(err, "could not unmarshal register response")
 	}
 	message, ok := response["message"]
 	if !ok {
@@ -561,32 +452,8 @@ func (c *Client) performRegistration(serverURL string, payload []byte) error {
 	if message.(string) != "registration successful" {
 		return fmt.Errorf("could not get register response: %s", message.(string))
 	}
-
 	c.State.Store(Idle)
-
 	return nil
-}
-
-// URL returns a new URL that can be used for external interaction requests.
-func (c *Client) URL() string {
-	if c.State.Load() == Closed {
-		return ""
-	}
-	data := make([]byte, c.CorrelationIdNonceLength)
-	_, _ = rand.Read(data)
-	randomData := zbase32.StdEncoding.EncodeToString(data)
-	if len(randomData) > c.CorrelationIdNonceLength {
-		randomData = randomData[:c.CorrelationIdNonceLength]
-	}
-
-	builder := &strings.Builder{}
-	builder.Grow(len(c.correlationID) + len(randomData) + len(c.serverURL.Host) + 1)
-	builder.WriteString(c.correlationID)
-	builder.WriteString(randomData)
-	builder.WriteString(".")
-	builder.WriteString(c.serverURL.Host)
-	URL := builder.String()
-	return URL
 }
 
 // decryptMessage decrypts an AES-256-RSA-OAEP encrypted message to string
@@ -627,23 +494,11 @@ func (c *Client) decryptMessage(key string, secureMessage string) ([]byte, error
 	return decoded, nil
 }
 
-func (c *Client) SaveSessionTo(filename string) error {
-	privateKeyData := x509.MarshalPKCS1PrivateKey(c.privKey)
-	publicKeyData, err := encodePublicKey(c.pubKey)
-	if err != nil {
-		return err
+func RandString(length int) string {
+	letters := []rune("0123456789abcdefghijklmnopqrstuvwxyz")
+	b := make([]rune, length)
+	for i := range b {
+		b[i] = letters[mathrand.Intn(len(letters))]
 	}
-	sessionInfo := &options.SessionInfo{
-		ServerURL:     c.serverURL.String(),
-		Token:         c.token,
-		PrivateKey:    string(privateKeyData),
-		CorrelationID: c.correlationID,
-		SecretKey:     c.secretKey,
-		PublicKey:     publicKeyData,
-	}
-	data, err := yaml.Marshal(sessionInfo)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(filename, data, os.ModePerm)
+	return string(b)
 }

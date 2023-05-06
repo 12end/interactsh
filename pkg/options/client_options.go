@@ -7,7 +7,9 @@ type CLIClientOptions struct {
 	Filter                   goflags.StringSlice
 	Config                   string
 	Version                  bool
-	ServerURL                string
+	Server                   string
+	Domain                   string
+	RoutePrefix              string
 	NumberOfPayloads         int
 	Output                   string
 	JSON                     bool
