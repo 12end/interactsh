@@ -34,6 +34,7 @@ type Interaction struct {
 
 // Options contains configuration options for the servers
 type Options struct {
+	RoutePrefix string
 	// Domains is the list domains for the instance.
 	Domains []string
 	// IPAddress is the IP address of the current server.

@@ -7,6 +7,7 @@ import (
 
 type CLIServerOptions struct {
 	Config                   string
+	RoutePrefix              string
 	Version                  bool
 	Debug                    bool
 	Domains                  goflags.StringSlice

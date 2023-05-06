@@ -62,6 +62,7 @@ func main() {
 
 	flagSet.CreateGroup("config", "config",
 		flagSet.StringVar(&cliOptions.Config, "config", defaultConfigLocation, "flag configuration file"),
+		flagSet.StringVarP(&cliOptions.RoutePrefix, "route-prefix", "rp", "/", "flag configuration file"),
 		flagSet.BoolVarP(&cliOptions.DynamicResp, "dynamic-resp", "dr", false, "enable setting up arbitrary response data"),
 		flagSet.StringVarP(&cliOptions.CustomRecords, "custom-records", "cr", "", "custom dns records YAML file for DNS server"),
 		flagSet.StringVarP(&cliOptions.HTTPIndex, "http-index", "hi", "", "custom index file for http server"),
@@ -286,6 +287,10 @@ func main() {
 	// manually cleans up stale OCSP from storage
 	acme.CleanupStorage()
 
+	serverOptions.RoutePrefix = cliOptions.RoutePrefix
+	if !strings.HasPrefix(serverOptions.RoutePrefix, "/") {
+		serverOptions.RoutePrefix = "/" + serverOptions.RoutePrefix
+	}
 	httpServer, err := server.NewHTTPServer(serverOptions)
 	if err != nil {
 		gologger.Fatal().Msgf("Could not create HTTP server: %s", err)
